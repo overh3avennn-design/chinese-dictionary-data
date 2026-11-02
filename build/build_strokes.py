@@ -17,6 +17,11 @@
         medians     осевая линия каждой черты — по ней идёт анимация
         radStrokes  номера черт ключа (у ~550 иероглифов их нет)
         radical     [ключ, русское название], например ["亻", "человек"]
+        layout      схема строения: ⿰ слева направо, ⿱ сверху вниз…
+        parts       части: [[знак, [номера черт], название ключа?], …],
+                    например 很 → [["彳", [0, 1, 2], "шаг"], ["艮", [3, …, 8], "упрямый"]];
+                    знак "" — у части нет своего знака. Нет поля — иероглиф
+                    на части не делится.
 
     Рядом кладёт тексты лицензий данных. Подробно — README.md.
 
@@ -108,6 +113,68 @@ def radical_name(form, names, char, data):
     return FU_LEFT if sum(xs) / len(xs) < 512 else FU_RIGHT
 
 
+# Описание строения иероглифа (IDS): оператор и его части, части бывают
+# вложенными: 学 = ⿱⿱⺍冖子. Число частей у каждого оператора.
+IDS_ARITY = {"⿰": 2, "⿱": 2, "⿲": 3, "⿳": 3, "⿴": 2, "⿵": 2, "⿶": 2, "⿷": 2,
+             "⿸": 2, "⿹": 2, "⿺": 2, "⿻": 2}
+
+
+def parse_ids(text, i=0):
+    """Дерево IDS: строка-иероглиф («？» — часть без своего знака) или
+    (оператор, [части]). Возвращает (узел, позиция после него)."""
+    c = text[i]
+    if c in IDS_ARITY:
+        kids, i = [], i + 1
+        for _ in range(IDS_ARITY[c]):
+            kid, i = parse_ids(text, i)
+            kids.append(kid)
+        return (c, kids), i
+    return c, i + 1
+
+
+def split_parts(entry, data, names):
+    """Части иероглифа для разбора: (схема, [[знак, [номера черт], название ключа?]…]).
+
+    Части — составляющие верхнего уровня; если такая составляющая сама не
+    иероглиф, а сборка из нескольких (学: ⿱⺍冖 сверху), берутся её части.
+    Черты — по полю matches (путь каждой черты в дереве). Частей без черт не
+    бывает; если осталось меньше двух — иероглиф на части не делится."""
+    decomposition = entry.get("decomposition") or ""
+    matches = entry.get("matches") or []
+    try:
+        tree, _ = parse_ids(decomposition)
+    except IndexError:
+        return None, []
+    if not isinstance(tree, tuple):
+        return None, []
+    layout, kids = tree
+    leaves = []                     # (путь, знак)
+    for k, kid in enumerate(kids):
+        if isinstance(kid, tuple):
+            for j, sub in enumerate(kid[1]):
+                leaves.append(((k, j), sub if isinstance(sub, str) else "？"))
+        else:
+            leaves.append(((k,), kid))
+    parts = []
+    for path, char in leaves:
+        strokes = [s for s, m in enumerate(matches)
+                   if m and tuple(m[:len(path)]) == path and s < len(data["strokes"])]
+        if not strokes:
+            continue
+        part = ["" if char == "？" else char, strokes]
+        name = None
+        if char == "阝":
+            name = radical_name(char, names, None, {"radStrokes": strokes, "medians": data["medians"]})
+        elif char in names:
+            name = names[char]
+        if name:
+            part.append(name)
+        parts.append(part)
+    if len(parts) < 2:
+        return None, []
+    return layout, parts
+
+
 def write_if_changed(path, text):
     try:
         with open(path, encoding="utf-8") as f:
@@ -124,16 +191,16 @@ def build():
     hwd = os.path.join(SOURCE, "hanzi-writer-data")
     if not os.path.isdir(hwd):
         sys.exit("Нет исходников в source/strokes/ — запустите с --download.")
-    radicals = {}
+    entries = {}
     with open(os.path.join(SOURCE, "dictionary.txt"), encoding="utf-8") as f:
         for line in f:
             entry = json.loads(line)
-            radicals[entry["character"]] = entry.get("radical")
+            entries[entry["character"]] = entry
     names = load_names()
 
     os.makedirs(OUT, exist_ok=True)
     chars = sorted(name[:-5] for name in os.listdir(hwd) if name.endswith(".json"))
-    written, unnamed, keep = 0, {}, set()
+    written, unnamed, keep, with_parts = 0, {}, set(), 0
     for char in chars:
         if len(char) != 1:
             continue
@@ -142,13 +209,21 @@ def build():
         out = {"strokes": data["strokes"], "medians": data["medians"]}
         if data.get("radStrokes"):
             out["radStrokes"] = data["radStrokes"]
-        form = radicals.get(char)
+        entry = entries.get(char, {})
+        form = entry.get("radical")
         if form:
             name = radical_name(form, names, char, data)
             if name:
                 out["radical"] = [form, name]
             else:
                 unnamed[form] = unnamed.get(form, 0) + 1
+        # Ключи (口, 木, 子…) — простые знаки: делить их на черточки (口 = 冂 + 一)
+        # ученику только мешает.
+        layout, parts = (None, []) if char in names else split_parts(entry, data, names)
+        if parts:
+            out["layout"] = layout
+            out["parts"] = parts
+            with_parts += 1
         file = f"{ord(char):x}.json"
         keep.add(file)
         text = json.dumps(out, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -169,7 +244,8 @@ def build():
 
     size = sum(os.path.getsize(os.path.join(OUT, n)) for n in keep)
     print(f"Иероглифов: {len(keep)}, {size / 1048576:.1f} МБ, "
-          f"в среднем {size / len(keep) / 1024:.1f} КБ. Изменено файлов: {written}, удалено: {removed}.")
+          f"в среднем {size / len(keep) / 1024:.1f} КБ. С разбором на части: {with_parts}. "
+          f"Изменено файлов: {written}, удалено: {removed}.")
     if unnamed:
         print("Нет названия в radicals-ru.tsv (ключ без названия не покажется):")
         for form, n in sorted(unnamed.items(), key=lambda x: -x[1]):
