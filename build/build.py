@@ -15,10 +15,15 @@
     В конце печатает размер всех данных и сколько загрузит первый поиск
     по нескольким примерам запросов. Подробно формат описан в README.md.
 
-Как запускать (из любой папки)
-    python3 -I build/build.py --download             скачать свежую базу в source/ и собрать
-    python3 -I build/build.py source/dabkrs_261029.gz
-    python3 -I build/build.py --report-only          только показать размер уже собранного
+    К статьям без пиньиня он подбирается (библиотека pypinyin), к статьям
+    без русского перевода добавляется машинный перевод (build/mt-ru.tsv) или
+    разбор по словам — см. раздел «дополнения к статьям».
+
+Как запускать (из любой папки; pypinyin стоит в source/.venv — один раз:
+python3 -m venv source/.venv && source/.venv/bin/pip install pypinyin)
+    source/.venv/bin/python -I build/build.py --download     скачать свежую базу в source/ и собрать
+    source/.venv/bin/python -I build/build.py source/dabkrs_261029.gz
+    python3 -I build/build.py --report-only                  только показать размер уже собранного
 
     Сборка занимает 6–7 минут и около 2,5 ГБ памяти. Старая папка
     v<версия>/ удаляется, meta.json переписывается последним — до этого
@@ -43,6 +48,9 @@ import urllib.request
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE_DIR = os.path.join(BASE, "source")
 HSK_WORDS = os.path.join(BASE, "build", "hsk-words.txt")
+# Машинный перевод частых статей, у которых в БКРС перевод не на русском:
+# «заголовок<TAB>перевод». Готовит человек (или ИИ), сборка только подставляет.
+MT_FILE = os.path.join(BASE, "build", "mt-ru.tsv")
 
 DOWNLOAD_PAGE = "https://dabkrs.com/p47"
 USER_AGENT = "Mozilla/5.0 (chinese-dictionary-data build script)"
@@ -411,6 +419,194 @@ def prefix_chars(s, units):
     return i
 
 
+# ------------------------------------------------- дополнения к статьям
+#
+# Сверх БКРС к статье добавляется (в write_entries — четвёртым элементом,
+# объектом, только если есть что добавить):
+#   a: 1        пиньинь подобран автоматически (у статьи его не было);
+#   m: "…"      машинный перевод на русский (build/mt-ru.tsv) — у частых
+#               статей, где в БКРС перевод на китайском или английском;
+#   w: [ID, …]  «разбор по словам»: статьи слов, из которых состоит
+#               заголовок, — у остальных статей без русского перевода.
+# Порядок статей (rank) и индекс пиньиня от этого не меняются: подобранный
+# пиньинь не ищется, чтобы поиск по пиньиню оставался точным. Машинный
+# перевод попадает в индекс русских слов.
+
+PURE_CJK = re.compile("[\u4e00-\u9fff]{2,}")
+HEAD_TOKEN = re.compile(CJK_RUN.pattern + "|[A-Za-z0-9]+")
+TONE_CHARS = "\u0304\u0301\u030c\u0300"
+VOWEL_START = set("aāáǎàoōóǒòeēéěè")
+SEGMENT_MAX = 8          # самое длинное слово при разбивке заголовка
+
+
+def load_pypinyin():
+    try:
+        import pypinyin
+        from pypinyin import constants
+    except ImportError:
+        sys.exit("Нужна библиотека pypinyin (подбор пиньиня). Один раз:\n"
+                 "  python3 -m venv source/.venv && source/.venv/bin/pip install pypinyin\n"
+                 "и запускать сборку так: source/.venv/bin/python -I build/build.py …")
+    return pypinyin, constants
+
+
+def align_pinyin(pypinyin, head, reading, cache):
+    """Пиньинь слова из БКРС («yínháng») → слоги по иероглифам
+    (["yín", "háng"]) или None, если не разложилось."""
+    target = re.sub(r"[\s'’‘\-·]", "", unicodedata.normalize("NFC", reading.lower()))
+    options = []
+    for ch in head:
+        if ch not in cache:
+            found = set()
+            for syl in pypinyin.pinyin(ch, heteronym=True, style=pypinyin.Style.TONE)[0]:
+                found.add(syl)
+                found.add(unicodedata.normalize("NFC", "".join(
+                    c for c in unicodedata.normalize("NFD", syl) if c not in TONE_CHARS)))
+            if ch == "儿":
+                found.add("r")
+            cache[ch] = sorted(found, key=len, reverse=True)
+        options.append(cache[ch])
+    out = []
+
+    def walk(i, pos):
+        if i == len(options):
+            return pos == len(target)
+        for syl in options[i]:
+            if target.startswith(syl, pos):
+                out.append(syl)
+                if walk(i + 1, pos + len(syl)):
+                    return True
+                out.pop()
+        return False
+
+    return out if walk(0, 0) else None
+
+
+def pinyin_maker(heads, pinyins):
+    """Функция «заголовок → пиньинь» для статей без пиньиня.
+
+    Чтения слов берутся у самого БКРС: слова с пиньинем раскладываются по
+    слогам и подсказываются pypinyin. На статьях БКРС с пиньинем такой
+    подбор совпадает целиком у 93–95% (расхождения — в основном лёгкий тон).
+    Слоги внутри слова пишутся слитно, слова — через пробел, как в БКРС:
+    «yīngjí yǎngqì shèbèi». 儿 отдельным словом в конце — эризация: lùr."""
+    pypinyin, constants = load_pypinyin()
+    cache, phrases = {}, {}
+    for h, p in zip(heads, pinyins):
+        if p and PURE_CJK.fullmatch(h) and not re.search(r"[,;/(]", p):
+            syllables = align_pinyin(pypinyin, h, p, cache)
+            if syllables:
+                phrases[h] = [[x] for x in syllables]
+    pypinyin.load_phrases_dict(phrases)
+    words = set(constants.PHRASES_DICT)
+    log(f"  чтений слов из БКРС: {len(phrases):,}, всего слов для разбивки: {len(words):,}")
+
+    def make(head):
+        tokens = []
+        for m in HEAD_TOKEN.finditer(head):
+            run = m.group()
+            if not CJK_RUN.fullmatch(run):
+                tokens.append(run)
+                continue
+            syllables = [x[0] for x in pypinyin.pinyin(run, style=pypinyin.Style.TONE)]
+            if len(syllables) != len(run) or any(CJK_RUN.search(x) for x in syllables):
+                return ""          # знак, которого pypinyin не знает
+            k, first = 0, True
+            words_here = segment(run, words)
+            # Короткое незнакомое слово (膜炎) — слитно, как пишет БКРС: móyán.
+            if len(run) <= 4 and all(len(w) == 1 for w in words_here):
+                words_here = [run]
+            for word in words_here:
+                syl = syllables[k:k + len(word)]
+                k += len(word)
+                if word == "儿" and not first and syl[0] in ("ér", "er"):
+                    tokens[-1] += "r"
+                    continue
+                tokens.append(syl[0] + "".join(("'" + x) if x[:1] in VOWEL_START else x for x in syl[1:]))
+                first = False
+        return " ".join(tokens)
+
+    return make
+
+
+def segment(run, words):
+    """Разбивка на слова: каждый раз самое длинное известное слово."""
+    out, i = [], 0
+    while i < len(run):
+        for size in range(min(SEGMENT_MAX, len(run) - i), 0, -1):
+            if size == 1 or run[i:i + size] in words:
+                out.append(run[i:i + size])
+                i += size
+                break
+    return out
+
+
+def load_mt():
+    mt = {}
+    if os.path.exists(MT_FILE):
+        with open(MT_FILE, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("#") or "\t" not in line:
+                    continue
+                head, text = line.rstrip("\n").split("\t", 1)
+                if text.strip():
+                    mt[head] = text.strip()
+    return mt
+
+
+def enrich(heads, pinyins, texts, ru_terms):
+    """Дополняет статьи (см. начало раздела). pinyins и ru_terms меняются
+    на месте; возвращает (auto — bytearray, 1 у подобранного пиньиня,
+    mt — {ID: перевод}, words — {ID: (ID слов…)})."""
+    total = len(heads)
+    mt_source = load_mt()
+    mt = {}
+    for i, h in enumerate(heads):
+        if h in mt_source and not CYRILLIC.search(texts[i]):
+            mt[i] = mt_source[h]
+            ru_terms[i] = russian_terms(mt[i])
+    log(f"  машинный перевод: {len(mt):,} статей (в {os.path.basename(MT_FILE)} — {len(mt_source):,})")
+
+    make = pinyin_maker(heads, pinyins)
+    auto = bytearray(total)
+    for i, h in enumerate(heads):
+        if not pinyins[i] and CJK_RUN.search(h):
+            p = make(h)
+            if p:
+                pinyins[i] = p
+                auto[i] = 1
+        if i and i % 500000 == 0:
+            log(f"  пиньинь: {i:,} статей просмотрено")
+    log(f"  пиньинь подобран: {sum(auto):,} статей")
+
+    # Слово с русским переводом → его самая важная статья.
+    russian = {}
+    for i, h in enumerate(heads):
+        if h not in russian and (i in mt or CYRILLIC.search(texts[i])):
+            russian[h] = i
+    words = {}
+    for i, h in enumerate(heads):
+        if i in mt or CYRILLIC.search(texts[i]):
+            continue
+        ids = []
+        for run in CJK_RUN.findall(h):
+            j = 0
+            while j < len(run):
+                for size in range(min(SEGMENT_MAX, len(run) - j), 0, -1):
+                    part = run[j:j + size]
+                    if part != h and part in russian:
+                        if russian[part] not in ids:
+                            ids.append(russian[part])
+                        j += size
+                        break
+                else:
+                    j += 1           # знака без русского перевода нет и в разборе
+        if ids:
+            words[i] = tuple(ids)
+    log(f"  разбор по словам: {len(words):,} статей")
+    return auto, mt, words
+
+
 # ------------------------------------------------------------------ сборка
 
 def load_hsk():
@@ -460,9 +656,12 @@ def build(source, out_dir):
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp)
 
+    log("Дополняю статьи: пиньинь, машинный перевод, разбор по словам")
+    auto, mt, words = enrich(heads, pinyins, texts, ru_terms)
+
     log("Пишу статьи")
-    entry_sizes = write_entries(tmp, heads, pinyins, texts)
-    del texts
+    entry_sizes = write_entries(tmp, heads, pinyins, texts, auto, mt, words)
+    del texts, auto, mt, words
 
     log("Индекс иероглифов")
     zh_first = write_zh(tmp, heads)
@@ -566,13 +765,23 @@ def json_size(item):
     return len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
 
 
-def write_entries(out, heads, pinyins, texts):
-    """Статьи по порядку ID: e/<N>.json — массив [иероглифы, пиньинь, перевод].
+def write_entries(out, heads, pinyins, texts, auto, mt, words):
+    """Статьи по порядку ID: e/<N>.json — массив [иероглифы, пиньинь, перевод]
+    или [иероглифы, пиньинь, перевод, {a, m, w}] — с дополнениями (enrich).
     Возвращает, сколько статей в каждом файле."""
     os.makedirs(os.path.join(out, "e"))
     sizes, chunk, chunk_bytes = [], [], 0
-    for h, p, t in zip(heads, pinyins, texts):
+    for i, (h, p, t) in enumerate(zip(heads, pinyins, texts)):
         item = [h, p, t]
+        extra = {}
+        if auto[i]:
+            extra["a"] = 1
+        if i in mt:
+            extra["m"] = mt[i]
+        if i in words:
+            extra["w"] = list(words[i])
+        if extra:
+            item.append(extra)
         size = json_size(item)
         if chunk and chunk_bytes + size > ENTRY_KB * 1024:
             write_json(os.path.join(out, "e", f"{len(sizes)}.json"), chunk)
